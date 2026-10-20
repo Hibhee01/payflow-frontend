@@ -44,6 +44,8 @@ const payflowMock = vi.hoisted(() => ({
   endMandate: vi.fn(),
 }));
 
+const endMandatesMock = vi.hoisted(() => vi.fn());
+
 const chainMock = vi.hoisted(() => ({
   chainMandatesFor: vi.fn(),
   chainMerchantSummary: vi.fn(),
@@ -58,6 +60,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
   return { api: apiMock, checkWebhookUrl: actual.checkWebhookUrl };
 });
 vi.mock("@/lib/payflow", () => ({ payflow: payflowMock, MAX_NAME_LEN: 64, nameByteLength: (n: string) => n.length }));
+vi.mock("@/lib/end-mandates", () => ({ endMandates: endMandatesMock }));
 vi.mock("@/lib/chain", () => chainMock);
 
 const MERCHANT = "GCH5VHWNS24VI75HLDBHK4SSJ2E5XZA5IB6XEZTNE4BJH7AKZI6Z3MHU";
@@ -76,6 +79,8 @@ beforeEach(() => {
   chainMock.chainPlanSubscriberCount.mockResolvedValue(null);
   payflowMock.feeBps.mockResolvedValue(100); // 1%
   payflowMock.createPlan.mockResolvedValue("tx-hash");
+  endMandatesMock.mockReset();
+  endMandatesMock.mockResolvedValue({ ended: [], failed: null });
   chainMock.chainMerchantSummary.mockReturnValue({
     merchant: MERCHANT,
     activeMandates: 0,

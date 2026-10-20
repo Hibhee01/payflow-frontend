@@ -576,6 +576,83 @@ export function mandateRefundableAmount(mandate: unknown): bigint | null {
   return null;
 }
 
+/**
+ * One step of a sequential batch of contract writes.
+ *
+ * `id` is the mandate id the step acts on, so a caller can map a failure back
+ * to the row the merchant selected without relying on array position.
+ */
+export interface BatchWriteStep<T> {
+  id: bigint;
+  run: () => Promise<T>;
+}
+
+export interface BatchWriteProgress<T> {
+  /** The step that just finished, 1-based. */
+  completed: number;
+  /** How many steps the batch was asked to run. */
+  total: number;
+  /** The id of the step that just finished. */
+  id: bigint;
+  /** The value the step resolved to. */
+  result: T;
+}
+
+export interface BatchWriteFailure<T> {
+  /** The id of the step that failed. */
+  id: bigint;
+  /** The error the step threw, unchanged. */
+  error: unknown;
+  /** Results of the steps that succeeded before the failure, in order. */
+  completed: Array<{ id: bigint; result: T }>;
+  /** How many steps succeeded before the failure. */
+  completedCount: number;
+  /** How many steps were never attempted. */
+  remainingCount: number;
+}
+
+export type BatchWriteOutcome<T> =
+  | { ok: true; results: Array<{ id: bigint; result: T }> }
+  | { ok: false; failure: BatchWriteFailure<T> };
+
+/**
+ * Run contract writes one at a time, stopping on the first failure.
+ *
+ * Writes are serialized rather than parallel because each one is signed by the
+ * wallet and submitted as its own transaction: firing them together would
+ * stack wallet prompts and race sequence numbers on the same source account.
+ * The outcome reports exactly how far the batch got so the UI can say which
+ * mandates were ended and which were not.
+ *
+ * Pure apart from the `run` callbacks, so it is testable without a wallet.
+ */
+export async function runSequentialWrites<T>(
+  steps: ReadonlyArray<BatchWriteStep<T>>,
+  onProgress?: (progress: BatchWriteProgress<T>) => void,
+): Promise<BatchWriteOutcome<T>> {
+  const results: Array<{ id: bigint; result: T }> = [];
+  for (let i = 0; i < steps.length; i += 1) {
+    const step = steps[i];
+    try {
+      const result = await step.run();
+      results.push({ id: step.id, result });
+      onProgress?.({ completed: i + 1, total: steps.length, id: step.id, result });
+    } catch (error) {
+      return {
+        ok: false,
+        failure: {
+          id: step.id,
+          error,
+          completed: results,
+          completedCount: results.length,
+          remainingCount: steps.length - results.length - 1,
+        },
+      };
+    }
+  }
+  return { ok: true, results };
+}
+
 /** A Stellar account a sponsor can pay into: a valid ed25519 public key. */
 export function validateRecipient(recipient: string): string | null {
   const trimmed = recipient.trim();

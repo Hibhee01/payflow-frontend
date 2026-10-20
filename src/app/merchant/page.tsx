@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import { batchEndPlan, type BatchEndItem, type BatchEndProgress } from "@/lib/batchEnd";
 import { api, checkWebhookUrl, type ApiMandate, type ApiPlan, type ApiWebhook, type MerchantSummary } from "@/lib/api";
 import { RevenueChart } from "@/components/RevenueChart";
 import { buildCsv, downloadCsv, exportFilename, type ChargeRow } from "@/lib/csv";
@@ -708,6 +709,14 @@ export default function MerchantPage() {
   const [discountSupport, setDiscountSupport] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<string | null>(null);
+  // Ids of mandates ticked for the "End selected" batch action.
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  // Whether the batch-end confirmation dialog is open.
+  const [confirmBatch, setConfirmBatch] = useState(false);
+  // Live progress of a running batch end, or null when idle.
+  const [batchProgress, setBatchProgress] = useState<BatchEndProgress | null>(null);
+  // Summary of the last batch end (successes and the first failure).
+  const [batchResult, setBatchResult] = useState<BatchEndItem[] | null>(null);
 
   // Plans are published in the configured token; mandates carry their own.
   const metas = useTokenMetas([
@@ -764,6 +773,9 @@ export default function MerchantPage() {
       }
     }
     setMandates(rows);
+    // Drop selections for mandates that no longer exist or are no longer endable.
+    const endableIds = new Set(rows.filter(endable).map((r) => r.id));
+    setSelected((prev) => new Set([...prev].filter((id) => endableIds.has(id))));
 
     // Revenue totals come from charge history, which only the indexer has.
     setSummary(s ?? chainMerchantSummary(address, rows));
@@ -946,6 +958,62 @@ export default function MerchantPage() {
     }
   }
 
+  /** Toggle one mandate's selection checkbox. */
+  function toggleSelected(id: number) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  /** Select or clear every endable mandate at once. */
+  function toggleSelectAll(ids: number[]) {
+    setSelected((prev) => {
+      const allSelected = ids.length > 0 && ids.every((id) => prev.has(id));
+      return allSelected ? new Set() : new Set(ids);
+    });
+  }
+
+  /**
+   * End every selected mandate sequentially, stopping on the first failure.
+   *
+   * Progress is reported per mandate so a partial failure is visible: the
+   * summary lists which mandates ended and which one failed (with its error).
+   */
+  async function endSelected() {
+    if (!address) return;
+    const ids = [...selected];
+    if (ids.length === 0) return;
+    setConfirmBatch(false);
+    setBusy("batch-end");
+    setError(null);
+    setDone(null);
+    setBatchResult(null);
+    setBatchProgress({ total: ids.length, completed: 0, current: ids[0] ?? null });
+    try {
+      const result = await batchEndPlan(ids, async (id, index) => {
+        setBatchProgress({ total: ids.length, completed: index, current: id });
+        return payflow.endMandate(address, signXdr, id);
+      });
+      setBatchProgress({ total: ids.length, completed: result.items.length, current: null });
+      setBatchResult(result.items);
+      if (result.failed === null) {
+        setSelected(new Set());
+      } else {
+        // Keep only the mandates that were not ended so the user can retry.
+        const ended = new Set(result.items.filter((i) => i.ok).map((i) => i.id));
+        setSelected((prev) => new Set([...prev].filter((id) => !ended.has(id))));
+      }
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   /** Gather every charge settled against the merchant's mandates and download it as CSV. */
   async function exportCsv() {
     setExporting(true);
@@ -1106,6 +1174,33 @@ export default function MerchantPage() {
       {done && (
         <Notice tone="ok">
           Done. Transaction <TxLink hash={done} />
+        </Notice>
+      )}
+      {batchProgress && (
+        <Notice tone={batchResult && batchResult.some((i) => !i.ok) ? "error" : "info"}>
+          <span aria-live="polite">
+            {batchProgress.current === null
+              ? `Batch end finished: ${batchProgress.completed} of ${batchProgress.total} processed.`
+              : `Ending mandate #${batchProgress.current} — ${batchProgress.completed} of ${batchProgress.total} done.`}
+          </span>
+        </Notice>
+      )}
+      {batchResult && (
+        <Notice tone={batchResult.some((i) => !i.ok) ? "error" : "ok"}>
+          <p>
+            {batchResult.filter((i) => i.ok).length} of {batchResult.length} mandates ended.
+          </p>
+          {batchResult.some((i) => !i.ok) && (
+            <ul className="mt-1 list-disc pl-5 text-sm">
+              {batchResult
+                .filter((i) => !i.ok)
+                .map((i) => (
+                  <li key={i.id}>
+                    Mandate #{i.id} failed: {i.error}
+                  </li>
+                ))}
+            </ul>
+          )}
         </Notice>
       )}
 
@@ -1371,6 +1466,57 @@ export default function MerchantPage() {
           </button>
         }
       >
+        {mandates !== null && mandates.some(endable) && (
+          <div className="mb-3 flex flex-wrap items-center gap-3 rounded-lg border border-edge p-3">
+            <span className="text-sm text-muted" aria-live="polite">
+              {selected.size} selected
+            </span>
+            <button
+              type="button"
+              className="btn-ghost"
+              disabled={busy !== null}
+              onClick={() => toggleSelectAll(mandates.filter(endable).map((m) => m.id))}
+            >
+              {mandates.filter(endable).every((m) => selected.has(m.id))
+                ? "Clear selection"
+                : "Select all"}
+            </button>
+            <button
+              type="button"
+              className="btn-danger"
+              disabled={busy !== null || networkMismatch || selected.size === 0}
+              onClick={() => setConfirmBatch(true)}
+            >
+              {busy === "batch-end" ? "Ending…" : `End selected (${selected.size})`}
+            </button>
+          </div>
+        )}
+        {confirmBatch && (
+          <div className="mb-3 rounded-lg border border-danger/40 bg-danger/10 p-3">
+            <p className="text-sm">
+              End {selected.size} {selected.size === 1 ? "mandate" : "mandates"} for good? This
+              cannot be undone.
+            </p>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <button
+                type="button"
+                className="btn-ghost"
+                disabled={busy !== null}
+                onClick={() => setConfirmBatch(false)}
+              >
+                Keep
+              </button>
+              <button
+                type="button"
+                className="btn-danger"
+                disabled={busy !== null || networkMismatch}
+                onClick={() => void endSelected()}
+              >
+                {busy === "batch-end" ? "Ending…" : `Confirm: end ${selected.size}`}
+              </button>
+            </div>
+          </div>
+        )}
         {mandates === null ? (
           <SkeletonRows rows={3} label="Loading subscribers" />
         ) : mandates.length === 0 ? (
@@ -1411,6 +1557,15 @@ export default function MerchantPage() {
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <div className="flex flex-wrap items-center gap-2">
+                        {endable(m) && (
+                          <input
+                            type="checkbox"
+                            checked={selected.has(m.id)}
+                            onChange={() => toggleSelected(m.id)}
+                            disabled={busy !== null}
+                            aria-label={`Select subscription #${m.id} for batch end`}
+                          />
+                        )}
                         <span className="font-medium">#{m.id}</span>
                         <AddressLink value={m.subscriber} />
                         <Badge status={m.status} />
