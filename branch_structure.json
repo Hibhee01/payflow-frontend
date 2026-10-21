@@ -1,0 +1,18 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "feat/issue-77-feat-merchant-end-several-mandates-at-once",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "feat/issue-77-feat-merchant-end-several-mandates-at-once": "main",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "feat/issue-77-feat-merchant-end-several-mandates-at-once",
+    "origin"
+  ]
+}
